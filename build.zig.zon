@@ -1,0 +1,16 @@
+.{
+    .name = .vulkan_tutorial,
+    .version = "0.0.0",
+    .fingerprint = 0xe6a82ef122f314,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}
