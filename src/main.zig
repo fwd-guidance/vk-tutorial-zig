@@ -23,6 +23,9 @@ pub const App = struct {
     window: ?*c.RGFW_window,
     instance: c.VkInstance,
     debugMessenger: c.VkDebugUtilsMessengerEXT,
+    physicalDevice: c.VkPhysicalDevice = null,
+    device: c.VkDevice,
+    graphicsQueue: c.VkQueue,
 
     pub fn init(self: *App) !void {
         self.*.allocator = std.heap.page_allocator;
@@ -33,6 +36,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        c.vkDestroyDevice(self.*.device, null);
         if (enableValidationLayers) {
             destroyDebugUtilMessengerEXT(self.instance, self.debugMessenger, null);
         }
@@ -51,6 +55,8 @@ pub const App = struct {
     fn initVulkan(self: *App) !void {
         try self.createInstance();
         try self.setupDebugMessenger();
+        try self.pickPhysicalDevice();
+        try self.createLogicalDevice();
     }
 
     fn mainLoop(self: *App) void {
@@ -193,6 +199,91 @@ pub const App = struct {
         std.debug.print("validation layer: {s}\n", .{pCallbackData.*.pMessage});
 
         return c.VK_FALSE;
+    }
+
+    fn pickPhysicalDevice(self: *App) !void {
+        var deviceCount: u32 = undefined;
+        _ = c.vkEnumeratePhysicalDevices(self.*.instance, &deviceCount, null);
+        if (deviceCount == 0) return error.NoVulkanEnabledGPUsAvailable;
+
+        const devices = try self.*.allocator.alloc(c.VkPhysicalDevice, deviceCount);
+        defer self.*.allocator.free(devices);
+
+        _ = c.vkEnumeratePhysicalDevices(self.*.instance, &deviceCount, devices.ptr);
+
+        for (devices) |device| {
+            if (try isDeviceSuitable(self, device)) {
+                self.*.physicalDevice = device;
+                break;
+            }
+        }
+
+        if (self.*.physicalDevice == null) return error.NoSuitableGPUAvailable;
+    }
+
+    fn isDeviceSuitable(self: *App, device: c.VkPhysicalDevice) !bool {
+        //var deviceProperties: c.VkPhysicalDeviceProperties = std.mem.zeroes(c.VkPhysicalDeviceProperties);
+        //var deviceFeatures: c.VkPhysicalDeviceFeatures = std.mem.zeroes(c.VkPhysicalDeviceFeatures);
+        //_ = c.vkGetPhysicalDeviceProperties(device, &deviceProperties);
+        //_ = c.vkGetPhysicalDeviceFeatures(device, &deviceFeatures);
+
+        //return deviceProperties.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and deviceFeatures.geometryShader == 1;
+        const indices: QueueFamilyIndices = try findQueueFamilies(self, device);
+        return if (indices.graphicsFamily) |_| true else false;
+    }
+
+    const QueueFamilyIndices = struct {
+        graphicsFamily: ?u32 = null,
+    };
+
+    fn findQueueFamilies(self: *App, device: c.VkPhysicalDevice) !QueueFamilyIndices {
+        var indices = QueueFamilyIndices{ .graphicsFamily = null };
+
+        var queueFamilyCount: u32 = undefined;
+        _ = c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, null);
+
+        const queueFamilies = try self.allocator.alloc(c.VkQueueFamilyProperties, queueFamilyCount);
+        defer self.*.allocator.free(queueFamilies);
+
+        _ = c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.ptr);
+
+        var i: u32 = 0;
+        for (queueFamilies) |queueFamily| {
+            if (queueFamily.queueFlags & c.VK_QUEUE_GRAPHICS_BIT != 0) {
+                indices.graphicsFamily = i;
+            }
+
+            if (indices.graphicsFamily) |_| break;
+            i += 1;
+        }
+
+        return indices;
+    }
+
+    fn createLogicalDevice(self: *App) !void {
+        const indices = try findQueueFamilies(self, self.*.physicalDevice);
+        const val = indices.graphicsFamily.?;
+
+        var queueCreateInfo = c.VkDeviceQueueCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = val, .queueCount = 1 };
+        var queuePriority: f32 = 1.0;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+
+        var deviceFeatures = c.VkPhysicalDeviceFeatures{};
+
+        var createInfo = c.VkDeviceCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pQueueCreateInfos = &queueCreateInfo, .queueCreateInfoCount = 1, .pEnabledFeatures = &deviceFeatures, .enabledExtensionCount = 0 };
+
+        if (enableValidationLayers) {
+            createInfo.enabledLayerCount = @as(u32, @intCast(validationLayers.len));
+            createInfo.ppEnabledLayerNames = &validationLayers;
+        } else {
+            createInfo.enabledLayerCount = 0;
+        }
+
+        if (c.vkCreateDevice(self.*.physicalDevice, &createInfo, null, &self.*.device) != c.VK_SUCCESS) {
+            return error.LogicalDeviceCreationFailure;
+        }
+
+        c.vkGetDeviceQueue(self.*.device, val, 0, &self.*.graphicsQueue);
     }
 };
 
