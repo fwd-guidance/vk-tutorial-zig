@@ -35,7 +35,11 @@ pub fn build(b: *std.Build) void {
             },
             .linux => {
                 art.linkSystemLibrary("X11");
+                art.linkSystemLibrary("Xrandr");
+                art.linkSystemLibrary("m");
                 art.linkSystemLibrary("GL");
+                art.linkSystemLibrary("cglm");
+                art.linkSystemLibrary("vulkan");
             },
             .windows => {
                 art.linkSystemLibrary("gdi32");
