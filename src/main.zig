@@ -26,6 +26,8 @@ pub const App = struct {
     physicalDevice: c.VkPhysicalDevice = null,
     device: c.VkDevice,
     graphicsQueue: c.VkQueue,
+    surface: c.VkSurfaceKHR,
+    presentQueue: c.VkQueue,
 
     pub fn init(self: *App) !void {
         self.*.allocator = std.heap.page_allocator;
@@ -40,6 +42,7 @@ pub const App = struct {
         if (enableValidationLayers) {
             destroyDebugUtilMessengerEXT(self.instance, self.debugMessenger, null);
         }
+        c.vkDestroySurfaceKHR(self.*.instance, self.*.surface, null);
         c.vkDestroyInstance(self.*.instance, null);
         c.RGFW_window_close(self.*.window);
     }
@@ -55,6 +58,7 @@ pub const App = struct {
     fn initVulkan(self: *App) !void {
         try self.createInstance();
         try self.setupDebugMessenger();
+        try self.createSurface();
         try self.pickPhysicalDevice();
         try self.createLogicalDevice();
     }
@@ -229,11 +233,16 @@ pub const App = struct {
 
         //return deviceProperties.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and deviceFeatures.geometryShader == 1;
         const indices: QueueFamilyIndices = try findQueueFamilies(self, device);
-        return if (indices.graphicsFamily) |_| true else false;
+        return indices.isComplete();
     }
 
     const QueueFamilyIndices = struct {
         graphicsFamily: ?u32 = null,
+        presentFamily: ?u32 = null,
+
+        pub fn isComplete(self: QueueFamilyIndices) bool {
+            return (self.graphicsFamily != null) and (self.presentFamily != null);
+        }
     };
 
     fn findQueueFamilies(self: *App, device: c.VkPhysicalDevice) !QueueFamilyIndices {
@@ -251,9 +260,12 @@ pub const App = struct {
         for (queueFamilies) |queueFamily| {
             if (queueFamily.queueFlags & c.VK_QUEUE_GRAPHICS_BIT != 0) {
                 indices.graphicsFamily = i;
+                var presentSupport = c.VK_FALSE;
+                _ = c.vkGetPhysicalDeviceSurfaceSupportKHR(device, i, self.*.surface, &presentSupport);
+                if (presentSupport == c.VK_TRUE) indices.presentFamily = i;
             }
 
-            if (indices.graphicsFamily) |_| break;
+            if (indices.isComplete()) break;
             i += 1;
         }
 
@@ -262,15 +274,27 @@ pub const App = struct {
 
     fn createLogicalDevice(self: *App) !void {
         const indices = try findQueueFamilies(self, self.*.physicalDevice);
-        const val = indices.graphicsFamily.?;
 
-        var queueCreateInfo = c.VkDeviceQueueCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = val, .queueCount = 1 };
+        var queueCreateInfos = std.ArrayList(c.VkDeviceQueueCreateInfo){};
+        defer queueCreateInfos.deinit(self.*.allocator);
+
+        var uniqueFamilyQueues = std.AutoHashMap(u32, void).init(self.*.allocator);
+        defer uniqueFamilyQueues.deinit();
+
+        try uniqueFamilyQueues.put(indices.graphicsFamily.?, {});
+        try uniqueFamilyQueues.put(indices.presentFamily.?, {});
+
         var queuePriority: f32 = 1.0;
-        queueCreateInfo.pQueuePriorities = &queuePriority;
+        var it = uniqueFamilyQueues.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
 
+            const queueCreateInfo = c.VkDeviceQueueCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = key, .queueCount = 1, .pQueuePriorities = &queuePriority };
+            try queueCreateInfos.append(self.*.allocator, queueCreateInfo);
+        }
         var deviceFeatures = c.VkPhysicalDeviceFeatures{};
 
-        var createInfo = c.VkDeviceCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pQueueCreateInfos = &queueCreateInfo, .queueCreateInfoCount = 1, .pEnabledFeatures = &deviceFeatures, .enabledExtensionCount = 0 };
+        var createInfo = c.VkDeviceCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pQueueCreateInfos = queueCreateInfos.items.ptr, .queueCreateInfoCount = 1, .pEnabledFeatures = &deviceFeatures, .enabledExtensionCount = 0 };
 
         if (enableValidationLayers) {
             createInfo.enabledLayerCount = @as(u32, @intCast(validationLayers.len));
@@ -283,7 +307,14 @@ pub const App = struct {
             return error.LogicalDeviceCreationFailure;
         }
 
-        c.vkGetDeviceQueue(self.*.device, val, 0, &self.*.graphicsQueue);
+        c.vkGetDeviceQueue(self.*.device, indices.graphicsFamily.?, 0, &self.*.graphicsQueue);
+        c.vkGetDeviceQueue(self.*.device, indices.presentFamily.?, 0, &self.*.presentQueue);
+    }
+
+    fn createSurface(self: *App) !void {
+        if (c.RGFW_window_createSurface_Vulkan(self.window, self.instance, &self.surface) != c.VK_SUCCESS) {
+            return error.SurfaceCreationFailure;
+        }
     }
 };
 
