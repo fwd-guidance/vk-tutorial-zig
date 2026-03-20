@@ -39,6 +39,7 @@ pub const App = struct {
     renderPass: c.VkRenderPass,
     pipelineLayout: c.VkPipelineLayout,
     graphicsPipeline: c.VkPipeline,
+    swapChainFramebuffers: []c.VkFramebuffer,
 
     pub fn init(self: *App) !void {
         self.*.allocator = std.heap.page_allocator;
@@ -49,6 +50,9 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        for (self.swapChainFramebuffers) |framebuffer| {
+            c.vkDestroyFramebuffer(self.*.device, framebuffer, null);
+        }
         c.vkDestroyPipeline(self.*.device, self.*.graphicsPipeline, null);
         c.vkDestroyPipelineLayout(self.*.device, self.*.pipelineLayout, null);
         c.vkDestroyRenderPass(self.*.device, self.*.renderPass, null);
@@ -83,6 +87,7 @@ pub const App = struct {
         try self.createImageViews();
         try self.createRenderPass();
         try self.createGraphicsPipeline();
+        try self.createFramebuffers();
     }
 
     fn mainLoop(self: *App) void {
@@ -438,7 +443,7 @@ pub const App = struct {
     }
 
     fn createImageViews(self: *App) !void {
-        var swapChainImageViews = try self.allocator.alloc(c.VkImageView, self.swapChainImages.len);
+        self.swapChainImageViews = try self.allocator.alloc(c.VkImageView, self.swapChainImages.len);
         for (0..self.swapChainImages.len) |i| {
             var createInfo = c.VkImageViewCreateInfo{};
             createInfo.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -455,7 +460,7 @@ pub const App = struct {
             createInfo.subresourceRange.baseArrayLayer = 0;
             createInfo.subresourceRange.layerCount = 1;
 
-            if (c.vkCreateImageView(self.*.device, &createInfo, null, &swapChainImageViews[i]) != c.VK_SUCCESS) {
+            if (c.vkCreateImageView(self.*.device, &createInfo, null, &self.swapChainImageViews[i]) != c.VK_SUCCESS) {
                 return error.ImageViewCreationError;
             }
         }
@@ -609,6 +614,29 @@ pub const App = struct {
         if (c.vkCreateGraphicsPipelines(self.*.device, null, 1, &pipelineInfo, null, &self.graphicsPipeline) != c.VK_SUCCESS) {
             return error.GraphicsPipelineCreation;
         }
+    }
+
+    fn createFramebuffers(self: *App) !void {
+        self.swapChainFramebuffers = try self.allocator.alloc(c.VkFramebuffer, self.swapChainImageViews.len);
+
+        for (0..self.swapChainImageViews.len) |i| {
+            const attachments = [_]c.VkImageView{self.swapChainImageViews[i]};
+
+            const framebufferInfo = c.VkFramebufferCreateInfo{
+                .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .renderPass = self.renderPass,
+                .attachmentCount = 1,
+                .pAttachments = &attachments,
+                .width = self.swapChainExtent.width,
+                .height = self.swapChainExtent.height,
+                .layers = 1,
+            };
+
+            if (c.vkCreateFramebuffer(self.*.device, &framebufferInfo, null, &self.swapChainFramebuffers[i]) != c.VK_SUCCESS) {
+                return error.FramebufferCreation;
+            }
+        }
+        return;
     }
 
     fn createSurface(self: *App) !void {
