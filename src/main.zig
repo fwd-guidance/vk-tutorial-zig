@@ -8,6 +8,8 @@ const c = @cImport({
     @cInclude("cglm/call.h");
 });
 
+const shaders = @import("shaders");
+
 const WIDTH: u32 = 1200;
 const HEIGHT: u32 = 800;
 
@@ -33,6 +35,10 @@ pub const App = struct {
     swapChainImages: []c.VkImage,
     swapChainImageFormat: c.VkFormat,
     swapChainExtent: c.VkExtent2D,
+    swapChainImageViews: []c.VkImageView,
+    renderPass: c.VkRenderPass,
+    pipelineLayout: c.VkPipelineLayout,
+    graphicsPipeline: c.VkPipeline,
 
     pub fn init(self: *App) !void {
         self.*.allocator = std.heap.page_allocator;
@@ -43,6 +49,12 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        c.vkDestroyPipeline(self.*.device, self.*.graphicsPipeline, null);
+        c.vkDestroyPipelineLayout(self.*.device, self.*.pipelineLayout, null);
+        c.vkDestroyRenderPass(self.*.device, self.*.renderPass, null);
+        for (self.swapChainImageViews) |imageView| {
+            c.vkDestroyImageView(self.*.device, imageView, null);
+        }
         c.vkDestroySwapchainKHR(self.*.device, self.*.swapChain, null);
         c.vkDestroyDevice(self.*.device, null);
         if (enableValidationLayers) {
@@ -68,6 +80,9 @@ pub const App = struct {
         try self.pickPhysicalDevice();
         try self.createLogicalDevice();
         try self.createSwapChain();
+        try self.createImageViews();
+        try self.createRenderPass();
+        try self.createGraphicsPipeline();
     }
 
     fn mainLoop(self: *App) void {
@@ -422,6 +437,180 @@ pub const App = struct {
         self.swapChainExtent = extent;
     }
 
+    fn createImageViews(self: *App) !void {
+        var swapChainImageViews = try self.allocator.alloc(c.VkImageView, self.swapChainImages.len);
+        for (0..self.swapChainImages.len) |i| {
+            var createInfo = c.VkImageViewCreateInfo{};
+            createInfo.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            createInfo.image = self.swapChainImages[i];
+            createInfo.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
+            createInfo.format = self.swapChainImageFormat;
+            createInfo.components.r = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.g = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.b = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.a = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+            createInfo.subresourceRange.baseMipLevel = 0;
+            createInfo.subresourceRange.levelCount = 1;
+            createInfo.subresourceRange.baseArrayLayer = 0;
+            createInfo.subresourceRange.layerCount = 1;
+
+            if (c.vkCreateImageView(self.*.device, &createInfo, null, &swapChainImageViews[i]) != c.VK_SUCCESS) {
+                return error.ImageViewCreationError;
+            }
+        }
+    }
+
+    fn createRenderPass(self: *App) !void {
+        const colorAttachment = c.VkAttachmentDescription{
+            .format = self.*.swapChainImageFormat,
+            .samples = c.VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = c.VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        };
+
+        const colorAttachmentRef = c.VkAttachmentReference{
+            .attachment = 0,
+            .layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+
+        const subpass = c.VkSubpassDescription{
+            .pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colorAttachmentRef,
+        };
+
+        const renderPassInfo = c.VkRenderPassCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .attachmentCount = 1,
+            .pAttachments = &colorAttachment,
+            .subpassCount = 1,
+            .pSubpasses = &subpass,
+        };
+
+        if (c.vkCreateRenderPass(self.*.device, &renderPassInfo, null, &self.renderPass) != c.VK_SUCCESS) {
+            return error.RenderPassCreation;
+        }
+    }
+
+    fn createGraphicsPipeline(self: *App) !void {
+        const vertShaderModule = try createShaderModule(self, &shaders.vert);
+        defer c.vkDestroyShaderModule(self.device, vertShaderModule, null);
+
+        const fragShaderModule = try createShaderModule(self, &shaders.frag);
+        defer c.vkDestroyShaderModule(self.device, fragShaderModule, null);
+
+        const vertShaderStageInfo = c.VkPipelineShaderStageCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = c.VK_SHADER_STAGE_VERTEX_BIT,
+            .module = vertShaderModule,
+            .pName = "main",
+        };
+        const fragShaderStageInfo = c.VkPipelineShaderStageCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = fragShaderModule,
+            .pName = "main",
+        };
+
+        const shaderStages = [_]c.VkPipelineShaderStageCreateInfo{ vertShaderStageInfo, fragShaderStageInfo };
+
+        const vertexInputInfo = c.VkPipelineVertexInputStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .vertexBindingDescriptionCount = 0,
+            .pVertexBindingDescriptions = null,
+            .vertexAttributeDescriptionCount = 0,
+            .pVertexAttributeDescriptions = null,
+        };
+
+        const inputAssembly = c.VkPipelineInputAssemblyStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            .primitiveRestartEnable = c.VK_FALSE,
+        };
+
+        const viewportState = c.VkPipelineViewportStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .viewportCount = 1,
+            .scissorCount = 1,
+        };
+
+        const rasterizer = c.VkPipelineRasterizationStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .depthClampEnable = c.VK_FALSE,
+            .rasterizerDiscardEnable = c.VK_FALSE,
+            .polygonMode = c.VK_POLYGON_MODE_FILL,
+            .lineWidth = 1.0,
+            .cullMode = c.VK_CULL_MODE_BACK_BIT,
+            .frontFace = c.VK_FRONT_FACE_CLOCKWISE,
+            .depthBiasEnable = c.VK_FALSE,
+        };
+
+        const multisampling = c.VkPipelineMultisampleStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            .sampleShadingEnable = c.VK_FALSE,
+            .rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT,
+        };
+
+        const colorBlendAttachment = c.VkPipelineColorBlendAttachmentState{
+            .colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT | c.VK_COLOR_COMPONENT_G_BIT | c.VK_COLOR_COMPONENT_B_BIT | c.VK_COLOR_COMPONENT_A_BIT,
+            .blendEnable = c.VK_FALSE,
+        };
+
+        const colorBlending = c.VkPipelineColorBlendStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .logicOpEnable = c.VK_FALSE,
+            .logicOp = c.VK_LOGIC_OP_COPY,
+            .attachmentCount = 1,
+            .pAttachments = &colorBlendAttachment,
+            .blendConstants = .{ 0.0, 0.0, 0.0, 0.0 },
+        };
+
+        const dynamicStates = [_]c.VkDynamicState{ c.VK_DYNAMIC_STATE_VIEWPORT, c.VK_DYNAMIC_STATE_SCISSOR };
+        const dynamicState = c.VkPipelineDynamicStateCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = @as(u32, @intCast(dynamicStates.len)),
+            .pDynamicStates = &dynamicStates,
+        };
+
+        const pipelineLayoutInfo = c.VkPipelineLayoutCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 0,
+            .pushConstantRangeCount = 0,
+        };
+
+        if (c.vkCreatePipelineLayout(self.*.device, &pipelineLayoutInfo, null, &self.pipelineLayout) != c.VK_SUCCESS) {
+            return error.PipelineLayoutCreation;
+        }
+
+        const pipelineInfo = c.VkGraphicsPipelineCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .stageCount = 2,
+            .pStages = &shaderStages,
+            .pVertexInputState = &vertexInputInfo,
+            .pInputAssemblyState = &inputAssembly,
+            .pViewportState = &viewportState,
+            .pRasterizationState = &rasterizer,
+            .pMultisampleState = &multisampling,
+            .pDepthStencilState = null,
+            .pColorBlendState = &colorBlending,
+            .pDynamicState = &dynamicState,
+            .layout = self.pipelineLayout,
+            .renderPass = self.renderPass,
+            .subpass = 0,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
+        };
+
+        if (c.vkCreateGraphicsPipelines(self.*.device, null, 1, &pipelineInfo, null, &self.graphicsPipeline) != c.VK_SUCCESS) {
+            return error.GraphicsPipelineCreation;
+        }
+    }
+
     fn createSurface(self: *App) !void {
         if (c.RGFW_window_createSurface_Vulkan(self.window, self.instance, &self.surface) != c.VK_SUCCESS) {
             return error.SurfaceCreationFailure;
@@ -506,6 +695,26 @@ pub const App = struct {
 
             return actualExtent;
         }
+    }
+
+    fn createShaderModule(self: *App, code: []align(4) const u8) !c.VkShaderModule {
+        var createInfo = c.VkShaderModuleCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = code.len,
+
+            // Because we enforced align(4) in the build script,
+            // this @ptrCast to a 32-bit pointer is completely safe!
+            .pCode = @as([*c]const u32, @ptrCast(code.ptr)),
+            .pNext = null,
+            .flags = 0,
+        };
+
+        var shaderModule: c.VkShaderModule = undefined;
+        if (c.vkCreateShaderModule(self.device, &createInfo, null, &shaderModule) != c.VK_SUCCESS) {
+            return error.ShaderModuleCreationFailure;
+        }
+
+        return shaderModule;
     }
 };
 

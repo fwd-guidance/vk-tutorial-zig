@@ -13,6 +13,32 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // 1. Setup Shader Compilation Commands
+    const compile_vert = b.addSystemCommand(&.{ "glslc", "-o" });
+    const vert_spv = compile_vert.addOutputFileArg("vert.spv");
+    compile_vert.addFileArg(b.path("shaders/shader.vert"));
+
+    const compile_frag = b.addSystemCommand(&.{ "glslc", "-o" });
+    const frag_spv = compile_frag.addOutputFileArg("frag.spv");
+    compile_frag.addFileArg(b.path("shaders/shader.frag"));
+
+    // 2. Create a WriteFiles step to bundle the compiled shaders with a Zig wrapper
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(vert_spv, "vert.spv");
+    _ = wf.addCopyFile(frag_spv, "frag.spv");
+
+    // 3. Generate a Zig file that embeds those freshly compiled binaries.
+    // CRITICAL: We use align(4) because Vulkan requires SPIR-V bytecode to be strictly 32-bit aligned!
+    const shaders_zig = wf.add("shaders.zig",
+        \\pub const vert align(4) = @embedFile("vert.spv").*;
+        \\pub const frag align(4) = @embedFile("frag.spv").*;
+    );
+
+    // 4. Add this generated file as an importable module to your executable
+    exe.root_module.addImport("shaders", b.createModule(.{
+        .root_source_file = shaders_zig,
+    }));
+
     const artifacts = [_]*std.Build.Step.Compile{exe};
 
     for (artifacts) |art| {
