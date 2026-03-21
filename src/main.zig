@@ -15,6 +15,8 @@ const HEIGHT: u32 = 800;
 
 const validationLayers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
 const deviceExtensions = [_][*c]const u8{c.VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+const MAX_FRAMES_IN_FLIGHT = 2;
+var currentFrame: u32 = 0;
 
 const enableValidationLayers = switch (builtin.mode) {
     .Debug => true,
@@ -41,14 +43,14 @@ pub const App = struct {
     graphicsPipeline: c.VkPipeline,
     swapChainFramebuffers: []c.VkFramebuffer,
     commandPool: c.VkCommandPool,
-    commandBuffer: c.VkCommandBuffer,
+    commandBuffers: [MAX_FRAMES_IN_FLIGHT]c.VkCommandBuffer,
 
-    imageAvailableSemaphore: c.VkSemaphore,
-    renderFinishedSemaphore: c.VkSemaphore,
-    inFlightFence: c.VkFence,
+    imageAvailableSemaphores: [MAX_FRAMES_IN_FLIGHT]c.VkSemaphore,
+    renderFinishedSemaphores: []c.VkSemaphore,
+    inFlightFences: [MAX_FRAMES_IN_FLIGHT]c.VkFence,
 
     pub fn init(self: *App) !void {
-        self.*.allocator = std.heap.page_allocator;
+        //self.*.allocator = std.heap.page_allocator;
 
         try self.initWindow();
         try self.initVulkan();
@@ -56,20 +58,31 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        c.vkDestroySemaphore(self.*.device, self.imageAvailableSemaphore, null);
-        c.vkDestroySemaphore(self.*.device, self.renderFinishedSemaphore, null);
-        c.vkDestroyFence(self.*.device, self.inFlightFence, null);
+        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
+            c.vkDestroySemaphore(self.*.device, self.imageAvailableSemaphores[i], null);
+            //c.vkDestroySemaphore(self.*.device, self.renderFinishedSemaphores[i], null);
+            c.vkDestroyFence(self.*.device, self.inFlightFences[i], null);
+        }
+
+        for (self.renderFinishedSemaphores) |semaphore| {
+            c.vkDestroySemaphore(self.*.device, semaphore, null);
+        }
+        self.allocator.free(self.renderFinishedSemaphores);
+
         c.vkDestroyCommandPool(self.*.device, self.*.commandPool, null);
         for (self.swapChainFramebuffers) |framebuffer| {
             c.vkDestroyFramebuffer(self.*.device, framebuffer, null);
         }
+        self.allocator.free(self.swapChainFramebuffers);
         c.vkDestroyPipeline(self.*.device, self.*.graphicsPipeline, null);
         c.vkDestroyPipelineLayout(self.*.device, self.*.pipelineLayout, null);
         c.vkDestroyRenderPass(self.*.device, self.*.renderPass, null);
         for (self.swapChainImageViews) |imageView| {
             c.vkDestroyImageView(self.*.device, imageView, null);
         }
+        self.allocator.free(self.swapChainImageViews);
         c.vkDestroySwapchainKHR(self.*.device, self.*.swapChain, null);
+        self.allocator.free(self.swapChainImages);
         c.vkDestroyDevice(self.*.device, null);
         if (enableValidationLayers) {
             destroyDebugUtilMessengerEXT(self.instance, self.debugMessenger, null);
@@ -126,30 +139,30 @@ pub const App = struct {
     }
 
     fn drawFrame(self: *App) !void {
-        _ = c.vkWaitForFences(self.*.device, 1, &self.inFlightFence, c.VK_TRUE, std.math.maxInt(u64));
-        _ = c.vkResetFences(self.*.device, 1, &self.inFlightFence);
+        _ = c.vkWaitForFences(self.*.device, 1, &self.inFlightFences[currentFrame], c.VK_TRUE, std.math.maxInt(u64));
+        _ = c.vkResetFences(self.*.device, 1, &self.inFlightFences[currentFrame]);
 
         var imageIndex: u32 = 0;
-        _ = c.vkAcquireNextImageKHR(self.*.device, self.swapChain, std.math.maxInt(u64), self.imageAvailableSemaphore, null, &imageIndex);
+        _ = c.vkAcquireNextImageKHR(self.*.device, self.swapChain, std.math.maxInt(u64), self.imageAvailableSemaphores[currentFrame], null, &imageIndex);
 
-        _ = c.vkResetCommandBuffer(self.commandBuffer, 0);
-        try self.recordCommandBuffer(self.commandBuffer, imageIndex);
+        _ = c.vkResetCommandBuffer(self.commandBuffers[currentFrame], 0);
+        try self.recordCommandBuffer(self.commandBuffers[currentFrame], imageIndex);
 
-        const waitSemaphores = [_]c.VkSemaphore{self.imageAvailableSemaphore};
+        const waitSemaphores = [_]c.VkSemaphore{self.imageAvailableSemaphores[currentFrame]};
         const waitStages = [_]c.VkPipelineStageFlags{c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-        const signalSemaphores = [_]c.VkSemaphore{self.renderFinishedSemaphore};
+        const signalSemaphores = [_]c.VkSemaphore{self.renderFinishedSemaphores[imageIndex]};
         const submitInfo = c.VkSubmitInfo{
             .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = &waitSemaphores,
             .pWaitDstStageMask = &waitStages,
             .commandBufferCount = 1,
-            .pCommandBuffers = &self.commandBuffer,
+            .pCommandBuffers = &self.commandBuffers[currentFrame],
             .signalSemaphoreCount = 1,
             .pSignalSemaphores = &signalSemaphores,
         };
 
-        if (c.vkQueueSubmit(self.*.graphicsQueue, 1, &submitInfo, self.inFlightFence) != c.VK_SUCCESS) {
+        if (c.vkQueueSubmit(self.*.graphicsQueue, 1, &submitInfo, self.inFlightFences[currentFrame]) != c.VK_SUCCESS) {
             return error.DrawCommandBufferSubmission;
         }
 
@@ -166,7 +179,7 @@ pub const App = struct {
 
         _ = c.vkQueuePresentKHR(self.presentQueue, &presentInfo);
 
-        return;
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     fn createInstance(self: *App) !void {
@@ -724,19 +737,23 @@ pub const App = struct {
     }
 
     fn createCommandBuffer(self: *App) !void {
+        //self.*.commandBuffers = try self.allocator.alloc(c.VkCommandBuffer, MAX_FRAMES_IN_FLIGHT);
+
         const allocInfo = c.VkCommandBufferAllocateInfo{
             .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = self.commandPool,
             .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1,
+            .commandBufferCount = @intCast(self.*.commandBuffers.len),
         };
 
-        if (c.vkAllocateCommandBuffers(self.*.device, &allocInfo, &self.commandBuffer) != c.VK_SUCCESS) {
+        if (c.vkAllocateCommandBuffers(self.*.device, &allocInfo, &self.commandBuffers) != c.VK_SUCCESS) {
             return error.CommandBufferAllocation;
         }
     }
 
     fn createSyncObjects(self: *App) !void {
+        self.*.renderFinishedSemaphores = try self.allocator.alloc(c.VkSemaphore, self.swapChainImages.len);
+
         const semaphoreInfo = c.VkSemaphoreCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         };
@@ -746,11 +763,18 @@ pub const App = struct {
             .flags = c.VK_FENCE_CREATE_SIGNALED_BIT,
         };
 
-        if (c.vkCreateSemaphore(self.*.device, &semaphoreInfo, null, &self.imageAvailableSemaphore) != c.VK_SUCCESS or
-            c.vkCreateSemaphore(self.*.device, &semaphoreInfo, null, &self.renderFinishedSemaphore) != c.VK_SUCCESS or
-            c.vkCreateFence(self.*.device, &fenceInfo, null, &self.inFlightFence) != c.VK_SUCCESS)
-        {
-            return error.SyncObjectCreation;
+        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
+            if (c.vkCreateSemaphore(self.*.device, &semaphoreInfo, null, &self.imageAvailableSemaphores[i]) != c.VK_SUCCESS or
+                c.vkCreateFence(self.*.device, &fenceInfo, null, &self.inFlightFences[i]) != c.VK_SUCCESS)
+            {
+                return error.SyncObjectCreation;
+            }
+        }
+
+        for (0..self.swapChainImages.len) |i| {
+            if (c.vkCreateSemaphore(self.*.device, &semaphoreInfo, null, &self.renderFinishedSemaphores[i]) != c.VK_SUCCESS) {
+                return error.SyncObjectCreation;
+            }
         }
     }
 
@@ -914,7 +938,13 @@ pub const App = struct {
 };
 
 pub fn main() !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer {
+        const deinit_status = gpa.deinit();
+        if (deinit_status == .leak) std.testing.expect(false) catch @panic("LEAK");
+    }
     var app: App = undefined;
+    app.allocator = gpa.allocator();
     try app.init();
     defer app.deinit();
 }
