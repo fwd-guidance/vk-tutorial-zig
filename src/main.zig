@@ -48,6 +48,7 @@ pub const App = struct {
     imageAvailableSemaphores: [MAX_FRAMES_IN_FLIGHT]c.VkSemaphore,
     renderFinishedSemaphores: []c.VkSemaphore,
     inFlightFences: [MAX_FRAMES_IN_FLIGHT]c.VkFence,
+    framebufferResized: bool = false,
 
     pub fn init(self: *App) !void {
         //self.*.allocator = std.heap.page_allocator;
@@ -58,9 +59,10 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.cleanupSwapChain();
+
         for (0..MAX_FRAMES_IN_FLIGHT) |i| {
             c.vkDestroySemaphore(self.*.device, self.imageAvailableSemaphores[i], null);
-            //c.vkDestroySemaphore(self.*.device, self.renderFinishedSemaphores[i], null);
             c.vkDestroyFence(self.*.device, self.inFlightFences[i], null);
         }
 
@@ -70,19 +72,10 @@ pub const App = struct {
         self.allocator.free(self.renderFinishedSemaphores);
 
         c.vkDestroyCommandPool(self.*.device, self.*.commandPool, null);
-        for (self.swapChainFramebuffers) |framebuffer| {
-            c.vkDestroyFramebuffer(self.*.device, framebuffer, null);
-        }
-        self.allocator.free(self.swapChainFramebuffers);
+
         c.vkDestroyPipeline(self.*.device, self.*.graphicsPipeline, null);
         c.vkDestroyPipelineLayout(self.*.device, self.*.pipelineLayout, null);
         c.vkDestroyRenderPass(self.*.device, self.*.renderPass, null);
-        for (self.swapChainImageViews) |imageView| {
-            c.vkDestroyImageView(self.*.device, imageView, null);
-        }
-        self.allocator.free(self.swapChainImageViews);
-        c.vkDestroySwapchainKHR(self.*.device, self.*.swapChain, null);
-        self.allocator.free(self.swapChainImages);
         c.vkDestroyDevice(self.*.device, null);
         if (enableValidationLayers) {
             destroyDebugUtilMessengerEXT(self.instance, self.debugMessenger, null);
@@ -95,6 +88,8 @@ pub const App = struct {
     fn initWindow(self: *App) !void {
         const window = c.RGFW_createWindow("Vulkan", 0, 0, WIDTH, HEIGHT, 0);
         if (window == null) return error.WindowCreationFailed;
+
+        c.RGFW_window_setUserPtr(window, self);
         _ = c.RGFW_setWindowResizedCallback(onWindowResize);
 
         self.*.window = window;
@@ -140,11 +135,18 @@ pub const App = struct {
 
     fn drawFrame(self: *App) !void {
         _ = c.vkWaitForFences(self.*.device, 1, &self.inFlightFences[currentFrame], c.VK_TRUE, std.math.maxInt(u64));
-        _ = c.vkResetFences(self.*.device, 1, &self.inFlightFences[currentFrame]);
 
         var imageIndex: u32 = 0;
-        _ = c.vkAcquireNextImageKHR(self.*.device, self.swapChain, std.math.maxInt(u64), self.imageAvailableSemaphores[currentFrame], null, &imageIndex);
+        var res = c.vkAcquireNextImageKHR(self.*.device, self.swapChain, std.math.maxInt(u64), self.imageAvailableSemaphores[currentFrame], null, &imageIndex);
 
+        if (res == c.VK_ERROR_OUT_OF_DATE_KHR) {
+            try self.recreateSwapChain();
+            return;
+        } else if (res != c.VK_SUCCESS and res != c.VK_SUBOPTIMAL_KHR) {
+            return error.SwapChainImageAcquisition;
+        }
+
+        _ = c.vkResetFences(self.*.device, 1, &self.inFlightFences[currentFrame]);
         _ = c.vkResetCommandBuffer(self.commandBuffers[currentFrame], 0);
         try self.recordCommandBuffer(self.commandBuffers[currentFrame], imageIndex);
 
@@ -177,7 +179,13 @@ pub const App = struct {
             .pResults = null,
         };
 
-        _ = c.vkQueuePresentKHR(self.presentQueue, &presentInfo);
+        res = c.vkQueuePresentKHR(self.presentQueue, &presentInfo);
+        if (res == c.VK_ERROR_OUT_OF_DATE_KHR or res == c.VK_SUBOPTIMAL_KHR or self.framebufferResized) {
+            self.framebufferResized = true;
+            try self.recreateSwapChain();
+        } else if (res != c.VK_SUCCESS) {
+            return error.SwapChainImagePresentation;
+        }
 
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
@@ -512,6 +520,44 @@ pub const App = struct {
 
         self.swapChainImageFormat = surfaceFormat.format;
         self.swapChainExtent = extent;
+    }
+
+    fn recreateSwapChain(self: *App) !void {
+        var height: i32 = 0;
+        var width: i32 = 0;
+        _ = c.RGFW_window_getSizeInPixels(self.window, &width, &height);
+
+        while (width == 0 or height == 0) {
+            _ = c.RGFW_waitForEvent(10);
+            var event: c.RGFW_event = undefined;
+            _ = c.RGFW_window_checkEvent(self.window, &event);
+
+            _ = c.RGFW_window_getSizeInPixels(self.window, &width, &height);
+        }
+
+        _ = c.vkDeviceWaitIdle(self.device);
+
+        self.cleanupSwapChain();
+
+        try self.createSwapChain();
+        try self.createImageViews();
+        try self.createFramebuffers();
+    }
+
+    fn cleanupSwapChain(self: *App) void {
+        for (self.swapChainFramebuffers) |fb| {
+            c.vkDestroyFramebuffer(self.device, fb, null);
+        }
+        self.allocator.free(self.swapChainFramebuffers);
+
+        for (self.swapChainImageViews) |iv| {
+            c.vkDestroyImageView(self.device, iv, null);
+        }
+        self.allocator.free(self.swapChainImageViews);
+
+        self.allocator.free(self.swapChainImages);
+
+        c.vkDestroySwapchainKHR(self.device, self.swapChain, null);
     }
 
     fn createImageViews(self: *App) !void {
@@ -950,9 +996,13 @@ pub fn main() !void {
 }
 
 fn onWindowResize(window: ?*c.RGFW_window, width: c_int, height: c_int) callconv(.c) void {
-    _ = window;
-    _ = width;
-    _ = height;
+    if (width <= 0 or height <= 0) return;
+
+    const ptr = c.RGFW_window_getUserPtr(window);
+    if (ptr == null) return;
+    const app: *App = @ptrCast(@alignCast(ptr));
+
+    app.framebufferResized = true;
 }
 
 pub fn window_example() !void {
