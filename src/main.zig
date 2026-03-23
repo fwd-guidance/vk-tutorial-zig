@@ -24,10 +24,13 @@ const enableValidationLayers = switch (builtin.mode) {
 };
 
 const vertices = [_]Vertex{
-    .{ .pos = .{ 0.0, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
-    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 1.0, 0.0 } },
-    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 } },
+    .{ .pos = .{ -0.5, -0.5 }, .color = .{ 1.0, 0.0, 0.0 } },
+    .{ .pos = .{ 0.5, -0.5 }, .color = .{ 0.0, 1.0, 0.0 } },
+    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0.0, 0.0, 1.0 } },
+    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 1.0, 1.0, 1.0 } },
 };
+
+const INDICES = [_]u16{ 0, 1, 2, 2, 3, 0 };
 
 pub const Vertex = extern struct {
     pos: c.vec2,
@@ -95,6 +98,8 @@ pub const App = struct {
 
     vertexBuffer: c.VkBuffer,
     vertexBufferMemory: c.VkDeviceMemory,
+    indexBuffer: c.VkBuffer,
+    indexBufferMemory: c.VkDeviceMemory,
 
     pub fn init(self: *App) !void {
         //self.*.allocator = std.heap.page_allocator;
@@ -106,6 +111,9 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.cleanupSwapChain();
+
+        c.vkDestroyBuffer(self.device, self.indexBuffer, null);
+        c.vkFreeMemory(self.device, self.indexBufferMemory, null);
 
         c.vkDestroyBuffer(self.device, self.vertexBuffer, null);
         c.vkFreeMemory(self.device, self.vertexBufferMemory, null);
@@ -157,6 +165,7 @@ pub const App = struct {
         try self.createFramebuffers();
         try self.createCommandPool();
         try self.createVertexBuffer();
+        try self.createIndexBuffer();
         try self.createCommandBuffer();
         try self.createSyncObjects();
     }
@@ -835,42 +844,122 @@ pub const App = struct {
         }
     }
 
-    fn createVertexBuffer(self: *App) !void {
+    fn createBuffer(self: *App, size: c.VkDeviceSize, usage: c.VkBufferUsageFlags, properties: c.VkMemoryPropertyFlags, buffer: *c.VkBuffer, bufferMemory: *c.VkDeviceMemory) !void {
         const bufferInfo = c.VkBufferCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = @sizeOf(@TypeOf(vertices)),
-            .usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            .size = size,
+            .usage = usage,
             .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
         };
 
-        if (c.vkCreateBuffer(self.device, &bufferInfo, null, &self.vertexBuffer) != c.VK_SUCCESS) {
-            return error.VertexBufferCreation;
+        if (c.vkCreateBuffer(self.device, &bufferInfo, null, buffer) != c.VK_SUCCESS) {
+            return error.BufferCreation;
         }
 
         var memRequirements: c.VkMemoryRequirements = .{};
-        _ = c.vkGetBufferMemoryRequirements(self.device, self.vertexBuffer, &memRequirements);
+        _ = c.vkGetBufferMemoryRequirements(self.device, buffer.*, &memRequirements);
 
         const allocInfo = c.VkMemoryAllocateInfo{
             .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .allocationSize = memRequirements.size,
-            .memoryTypeIndex = try findMemoryType(self, memRequirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            .memoryTypeIndex = try findMemoryType(self, memRequirements.memoryTypeBits, properties),
         };
 
-        if (c.vkAllocateMemory(self.device, &allocInfo, null, &self.vertexBufferMemory) != c.VK_SUCCESS) {
-            return error.VertexBufferMalloc;
+        if (c.vkAllocateMemory(self.device, &allocInfo, null, bufferMemory) != c.VK_SUCCESS) {
+            return error.BufferMalloc;
         }
 
-        _ = c.vkBindBufferMemory(self.device, self.vertexBuffer, self.vertexBufferMemory, 0);
+        _ = c.vkBindBufferMemory(self.device, buffer.*, bufferMemory.*, 0);
+    }
+
+    fn copyBuffer(self: *App, srcBuffer: c.VkBuffer, dstBuffer: c.VkBuffer, size: c.VkDeviceSize) void {
+        const allocInfo = c.VkCommandBufferAllocateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandPool = self.commandPool,
+            .commandBufferCount = 1,
+        };
+
+        var commandBuffer: c.VkCommandBuffer = undefined;
+        _ = c.vkAllocateCommandBuffers(self.device, &allocInfo, &commandBuffer);
+
+        var beginInfo = c.VkCommandBufferBeginInfo{
+            .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+
+        _ = c.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        var copyRegion = c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = size,
+        };
+
+        _ = c.vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        _ = c.vkEndCommandBuffer(commandBuffer);
+
+        var submitInfo = c.VkSubmitInfo{
+            .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+        };
+
+        _ = c.vkQueueSubmit(self.graphicsQueue, 1, &submitInfo, null);
+        _ = c.vkQueueWaitIdle(self.graphicsQueue);
+
+        _ = c.vkFreeCommandBuffers(self.device, self.commandPool, 1, &commandBuffer);
+    }
+
+    fn createVertexBuffer(self: *App) !void {
+        const bufferSize: u32 = @sizeOf(@TypeOf(vertices));
+
+        var stagingBuffer: c.VkBuffer = undefined;
+        var stagingBufferMemory: c.VkDeviceMemory = undefined;
+        try createBuffer(self, bufferSize, c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingBufferMemory);
 
         var data: ?*anyopaque = null;
 
-        if (c.vkMapMemory(self.device, self.vertexBufferMemory, 0, bufferInfo.size, 0, &data) != c.VK_SUCCESS) {
-            return error.mmapFailed;
+        if (c.vkMapMemory(self.device, stagingBufferMemory, 0, bufferSize, 0, &data) != c.VK_SUCCESS) {
+            return error.mmapFailure;
         }
 
         const mapped_memory: [*]Vertex = @ptrCast(@alignCast(data));
         @memcpy(mapped_memory[0..vertices.len], &vertices);
-        c.vkUnmapMemory(self.device, self.vertexBufferMemory);
+        c.vkUnmapMemory(self.device, stagingBufferMemory);
+
+        try createBuffer(self, bufferSize, c.VK_BUFFER_USAGE_TRANSFER_DST_BIT | c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.vertexBuffer, &self.vertexBufferMemory);
+
+        copyBuffer(self, stagingBuffer, self.vertexBuffer, bufferSize);
+
+        c.vkDestroyBuffer(self.device, stagingBuffer, null);
+        c.vkFreeMemory(self.device, stagingBufferMemory, null);
+    }
+
+    fn createIndexBuffer(self: *App) !void {
+        const bufferSize: u32 = @sizeOf(@TypeOf(INDICES));
+
+        var stagingBuffer: c.VkBuffer = undefined;
+        var stagingBufferMemory: c.VkDeviceMemory = undefined;
+        try createBuffer(self, bufferSize, c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingBufferMemory);
+
+        var data: ?*anyopaque = null;
+
+        if (c.vkMapMemory(self.device, stagingBufferMemory, 0, bufferSize, 0, &data) != c.VK_SUCCESS) {
+            return error.mmapFailure;
+        }
+
+        const mapped_memory: [*]u16 = @ptrCast(@alignCast(data));
+        @memcpy(mapped_memory[0..INDICES.len], &INDICES);
+        c.vkUnmapMemory(self.device, stagingBufferMemory);
+
+        try createBuffer(self, bufferSize, c.VK_BUFFER_USAGE_TRANSFER_DST_BIT | c.VK_BUFFER_USAGE_INDEX_BUFFER_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.indexBuffer, &self.indexBufferMemory);
+
+        copyBuffer(self, stagingBuffer, self.indexBuffer, bufferSize);
+
+        c.vkDestroyBuffer(self.device, stagingBuffer, null);
+        c.vkFreeMemory(self.device, stagingBufferMemory, null);
     }
 
     fn createCommandBuffer(self: *App) !void {
@@ -1080,8 +1169,10 @@ pub const App = struct {
         const vertexBuffers = [_]c.VkBuffer{self.vertexBuffer};
         const offsets = [_]c.VkDeviceSize{0};
         _ = c.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffers, &offsets);
+        _ = c.vkCmdBindIndexBuffer(commandBuffer, self.indexBuffer, 0, c.VK_INDEX_TYPE_UINT16);
 
-        _ = c.vkCmdDraw(commandBuffer, @intCast(vertices.len), 1, 0, 0);
+        //_ = c.vkCmdDraw(commandBuffer, @intCast(vertices.len), 1, 0, 0);
+        _ = c.vkCmdDrawIndexed(commandBuffer, @as(u32, @intCast(INDICES.len)), 1, 0, 0, 0);
 
         _ = c.vkCmdEndRenderPass(commandBuffer);
 
