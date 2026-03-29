@@ -32,6 +32,12 @@ const vertices = [_]Vertex{
 
 const INDICES = [_]u16{ 0, 1, 2, 2, 3, 0 };
 
+pub const UniformBufferObject = extern struct {
+    model: c.mat4 align(16),
+    view: c.mat4 align(16),
+    proj: c.mat4 align(16),
+};
+
 pub const Vertex = extern struct {
     pos: c.vec2,
     color: c.vec3,
@@ -71,6 +77,7 @@ pub const Vertex = extern struct {
 
 pub const App = struct {
     allocator: std.mem.Allocator,
+    startTime: i64,
     window: ?*c.RGFW_window,
     instance: c.VkInstance,
     debugMessenger: c.VkDebugUtilsMessengerEXT,
@@ -85,6 +92,7 @@ pub const App = struct {
     swapChainExtent: c.VkExtent2D,
     swapChainImageViews: []c.VkImageView,
     renderPass: c.VkRenderPass,
+    descriptorSetLayout: c.VkDescriptorSetLayout,
     pipelineLayout: c.VkPipelineLayout,
     graphicsPipeline: c.VkPipeline,
     swapChainFramebuffers: []c.VkFramebuffer,
@@ -100,9 +108,15 @@ pub const App = struct {
     vertexBufferMemory: c.VkDeviceMemory,
     indexBuffer: c.VkBuffer,
     indexBufferMemory: c.VkDeviceMemory,
+    uniformBuffers: [MAX_FRAMES_IN_FLIGHT]c.VkBuffer,
+    uniformBuffersMemory: [MAX_FRAMES_IN_FLIGHT]c.VkDeviceMemory,
+    uniformBuffersMapped: [MAX_FRAMES_IN_FLIGHT]?*anyopaque,
+    descriptorPool: c.VkDescriptorPool,
+    descriptorSets: [MAX_FRAMES_IN_FLIGHT]c.VkDescriptorSet,
 
     pub fn init(self: *App) !void {
         //self.*.allocator = std.heap.page_allocator;
+        self.startTime = std.time.milliTimestamp();
 
         try self.initWindow();
         try self.initVulkan();
@@ -111,6 +125,15 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.cleanupSwapChain();
+
+        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
+            c.vkDestroyBuffer(self.device, self.uniformBuffers[i], null);
+            c.vkFreeMemory(self.device, self.uniformBuffersMemory[i], null);
+        }
+
+        c.vkDestroyDescriptorPool(self.device, self.descriptorPool, null);
+
+        c.vkDestroyDescriptorSetLayout(self.device, self.descriptorSetLayout, null);
 
         c.vkDestroyBuffer(self.device, self.indexBuffer, null);
         c.vkFreeMemory(self.device, self.indexBufferMemory, null);
@@ -161,11 +184,15 @@ pub const App = struct {
         try self.createSwapChain();
         try self.createImageViews();
         try self.createRenderPass();
+        try self.createDescriptorSetLayout();
         try self.createGraphicsPipeline();
         try self.createFramebuffers();
         try self.createCommandPool();
         try self.createVertexBuffer();
         try self.createIndexBuffer();
+        try self.createUniformBuffers();
+        try self.createDescriptorPool();
+        try self.createDescriptorSets();
         try self.createCommandBuffer();
         try self.createSyncObjects();
     }
@@ -204,6 +231,8 @@ pub const App = struct {
         } else if (res != c.VK_SUCCESS and res != c.VK_SUBOPTIMAL_KHR) {
             return error.SwapChainImageAcquisition;
         }
+
+        self.updateUniformBuffer(currentFrame);
 
         _ = c.vkResetFences(self.*.device, 1, &self.inFlightFences[currentFrame]);
         _ = c.vkResetCommandBuffer(self.commandBuffers[currentFrame], 0);
@@ -690,6 +719,26 @@ pub const App = struct {
         }
     }
 
+    fn createDescriptorSetLayout(self: *App) !void {
+        const uboLayoutBinding = c.VkDescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = null,
+        };
+
+        var layoutInfo = c.VkDescriptorSetLayoutCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &uboLayoutBinding,
+        };
+
+        if (c.vkCreateDescriptorSetLayout(self.device, &layoutInfo, null, &self.descriptorSetLayout) != c.VK_SUCCESS) {
+            return error.DescriptorSetLayoutCreation;
+        }
+    }
+
     fn createGraphicsPipeline(self: *App) !void {
         const vertShaderModule = try createShaderModule(self, &shaders.vert);
         defer c.vkDestroyShaderModule(self.device, vertShaderModule, null);
@@ -742,7 +791,7 @@ pub const App = struct {
             .polygonMode = c.VK_POLYGON_MODE_FILL,
             .lineWidth = 1.0,
             .cullMode = c.VK_CULL_MODE_BACK_BIT,
-            .frontFace = c.VK_FRONT_FACE_CLOCKWISE,
+            .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE,
             .depthBiasEnable = c.VK_FALSE,
         };
 
@@ -775,8 +824,9 @@ pub const App = struct {
 
         const pipelineLayoutInfo = c.VkPipelineLayoutCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .setLayoutCount = 0,
-            .pushConstantRangeCount = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &self.descriptorSetLayout,
+            //.pushConstantRangeCount = 0,
         };
 
         if (c.vkCreatePipelineLayout(self.*.device, &pipelineLayoutInfo, null, &self.pipelineLayout) != c.VK_SUCCESS) {
@@ -960,6 +1010,95 @@ pub const App = struct {
 
         c.vkDestroyBuffer(self.device, stagingBuffer, null);
         c.vkFreeMemory(self.device, stagingBufferMemory, null);
+    }
+
+    fn createUniformBuffers(self: *App) !void {
+        const bufferSize = @sizeOf(UniformBufferObject);
+
+        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
+            try createBuffer(self, bufferSize, c.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &self.uniformBuffers[i], &self.uniformBuffersMemory[i]);
+
+            _ = c.vkMapMemory(self.device, self.uniformBuffersMemory[i], 0, bufferSize, 0, &self.uniformBuffersMapped[i]);
+        }
+    }
+
+    fn createDescriptorPool(self: *App) !void {
+        const poolSize = c.VkDescriptorPoolSize{
+            .type = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT,
+        };
+
+        const poolInfo = c.VkDescriptorPoolCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .poolSizeCount = 1,
+            .pPoolSizes = &poolSize,
+            .maxSets = MAX_FRAMES_IN_FLIGHT,
+        };
+
+        if (c.vkCreateDescriptorPool(self.device, &poolInfo, null, &self.descriptorPool) != c.VK_SUCCESS) {
+            return error.DescriptorPoolCreation;
+        }
+    }
+
+    fn createDescriptorSets(self: *App) !void {
+        const layouts = [_]c.VkDescriptorSetLayout{self.descriptorSetLayout} ** MAX_FRAMES_IN_FLIGHT;
+
+        const allocInfo = c.VkDescriptorSetAllocateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = self.descriptorPool,
+            .descriptorSetCount = MAX_FRAMES_IN_FLIGHT,
+            .pSetLayouts = &layouts,
+        };
+
+        if (c.vkAllocateDescriptorSets(self.device, &allocInfo, &self.descriptorSets[0]) != c.VK_SUCCESS) {
+            return error.DescriptorSetAllocation;
+        }
+
+        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
+            const bufferInfo = c.VkDescriptorBufferInfo{
+                .buffer = self.uniformBuffers[i],
+                .offset = 0,
+                .range = @sizeOf(UniformBufferObject),
+            };
+
+            const descriptorWrite = c.VkWriteDescriptorSet{
+                .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = self.descriptorSets[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .pBufferInfo = &bufferInfo,
+            };
+
+            c.vkUpdateDescriptorSets(self.device, 1, &descriptorWrite, 0, null);
+        }
+    }
+
+    fn updateUniformBuffer(self: *App, currentImage: u32) void {
+        //const startTime = std.time.milliTimestamp();
+        const currentTime = std.time.milliTimestamp();
+
+        const time = @as(f32, @floatFromInt(currentTime - self.startTime)) / 1000.0;
+
+        var ubo: UniformBufferObject = undefined;
+        c.glmc_mat4_identity(&ubo.model);
+        var axis = c.vec3{ 0.0, 0.0, 1.0 };
+        const angle = time * std.math.degreesToRadians(90.0);
+        c.glmc_rotate(&ubo.model, angle, &axis);
+
+        var eye = c.vec3{ 2.0, 2.0, 2.0 };
+        var center = c.vec3{ 0.0, 0.0, 0.0 };
+        var up = c.vec3{ 0.0, 0.0, 1.0 };
+        c.glmc_lookat(&eye, &center, &up, &ubo.view);
+
+        const aspect = @as(f32, @floatFromInt(self.swapChainExtent.width)) / @as(f32, @floatFromInt(self.swapChainExtent.height));
+        c.glmc_perspective(std.math.degreesToRadians(45.0), aspect, 0.1, 10.0, &ubo.proj);
+
+        ubo.proj[1][1] *= -1.0; // y-flip;
+
+        const mapped_memory: [*]UniformBufferObject = @ptrCast(@alignCast(self.uniformBuffersMapped[currentImage]));
+        mapped_memory[0] = ubo;
     }
 
     fn createCommandBuffer(self: *App) !void {
@@ -1172,6 +1311,8 @@ pub const App = struct {
         _ = c.vkCmdBindIndexBuffer(commandBuffer, self.indexBuffer, 0, c.VK_INDEX_TYPE_UINT16);
 
         //_ = c.vkCmdDraw(commandBuffer, @intCast(vertices.len), 1, 0, 0);
+        _ = c.vkCmdBindDescriptorSets(commandBuffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipelineLayout, 0, 1, &self.descriptorSets[currentFrame], 0, null);
+
         _ = c.vkCmdDrawIndexed(commandBuffer, @as(u32, @intCast(INDICES.len)), 1, 0, 0, 0);
 
         _ = c.vkCmdEndRenderPass(commandBuffer);
